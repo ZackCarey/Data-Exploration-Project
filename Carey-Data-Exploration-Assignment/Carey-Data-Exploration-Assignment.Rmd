@@ -1,0 +1,188 @@
+---
+title: "Data Exploration Project"
+author: "Zack Carey"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Libraries
+
+Load all needed libraries:
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(fixest)
+library(jtools)
+library(lubridate)
+library(tidyverse)
+library(tibble)
+```
+
+## Introduction
+
+In this analysis, we will be looking at Google Trends data to see if the release of The College Scorecard, which came out at the beginning of September 2015, shifted student interest to high-earnings colleges relative to low-earnings ones among colleges that predominantly grant bachelor's degrees. The College Scorecard includes the median earnings of graduates ten years after graduation for each college, which is one of the main variables we will be working with. However, the data is pretty messy, so we need to clean it up before we can do our analysis.
+
+## Data Cleaning
+
+First, I read in the data and made some simple preliminary changes to make our data more compatible. (see comments)
+
+```{r}
+# Read in google trends data as one df
+gtrends <- list.files(path = "Data", pattern = "trends_up_to_", full.names = TRUE) %>%
+  lapply(read_csv) %>%
+  bind_rows
+
+# Read in scorecard data file
+scores <- read.csv('./Data/Most+Recent+Cohorts+(Scorecard+Elements).csv')
+
+# Change column names to lowercase to match other files
+names(scores) <- tolower(names(scores))
+
+# Read in ID name link file
+IDNameLink <- read.csv('./Data/id_name_link.csv')
+
+# Remove dupes in IDNameLink
+IDNameLink <- IDNameLink %>%
+  group_by(schname) %>%
+  mutate(N = n()) %>%
+  filter(N == 1)
+```
+
+Now we have our Google Trends data, our Scorecard data, and our dataset to link them both together.
+
+Next, I merged our Google Trends data with the ID Name Link data set so that we can combine it with our scorecard data later on.
+
+```{r}
+# Merge IDNameLink and trends by school name
+merge1 <- merge(IDNameLink, gtrends, "schname")
+```
+
+Then, I got rid of the unnecessary variables in the Scorecard data and filtered it to only colleges that primarily grant bachelor's degrees. The variables I kept were the two identification variables for the colleges, the primary degree type, and the reported median earnings of graduates ten years after graduation for each college.
+
+```{r}
+# Filter to just schools that predominantly grant Bachelor's degrees
+bachelorScores <- scores %>%
+  select(unitid, opeid, preddeg, md_earn_wne_p10.reported.earnings) %>%
+  filter(preddeg == 3)
+```
+
+After doing that, I was able to combine the Google Trends data and our filtered/cleaned Scorecard data using the 'unitid' and 'opeid' identification variables. 
+
+```{r}
+# Adding median earnings of graduates ten years after graduation for each college
+data <- merge(merge1, bachelorScores, c('unitid' = 'unitid', 'opeid' = 'opeid'), no.dups = TRUE)
+```
+
+Next, I decided to add a dummy variable to indicate whether a college is considered a "high-earnings" college using an ifelse statement. In order to come up with the threshold for a college to be considered high-earnings, I had to do some research. I found a report from the National Association of Colleges and Employers (NACE) that said that the average starting salary for college graduates from the class of 2020 was $55,260. I decided to round that number down to an even 55,000 so that earnings above the average would be our threshold for being considered high-earnings.
+
+```{r}
+# Adding a dummy variable to identify colleges with median earnings of $55,000 or more for graduates ten years after graduation as high-earnings colleges
+data$earnings <- ifelse(data$md_earn_wne_p10.reported.earnings >= 55000, "1", "0")
+```
+
+Now we have most of our data! However, it still was not exactly in the format I wanted it to be in to work with. The variable 'monthorweek' still shows the start date and end date for each week, which would be harder to work with. It also didn't make sense to me to keep the keywords in the data, so I added up the index of searches for each keyword for each week and did that for each college. That way, each college has a record of the index of searches for all of its keywords for each week.
+
+```{r}
+# Getting total searches for each college for each week and formatting the 'monthorweek' variable
+dataGrouped <- data %>%
+  mutate(date = as.Date(str_sub(monthorweek, 1, 10))) %>%
+  group_by(week = floor_date(date, "week"), opeid) %>%
+  summarize(index = sum(index, na.rm = TRUE))
+```
+
+However, this new dataset only has three variables: our new 'week' variable, the 'opeid' school identifier variable, and our new 'index' variable that adds up all all keyword searches for each college. Now we need to add this back to our original dataset without messing up anything we did earlier to get our final dataset to run our regression with. 
+
+```{r}
+# Adding back variables from IDNameLink and bachelorScores
+join1 <- left_join(IDNameLink, bachelorScores, 'opeid')
+join2 <- left_join(dataGrouped, join1, 'opeid')
+
+# In doing so, I created a duplicate 'unitid' column. This code removes it.
+join2 <- subset(join2, select = -c(unitid.y))
+names(join2)[names(join2) == 'unitid.x'] <- 'unitid'
+```
+
+We're almost back to where we want to be. We just have to add back our dummy variable (high earnings), do the final join, and drop any N/A columns.
+
+```{r}
+# Add back our high earnings dummy variable
+select1 <- data %>%
+  select(earnings, opeid)
+distinct1 <- distinct(select1, opeid, earnings)
+
+# Final join, dropping N/A columns, standardizing index
+dataFinal <- left_join(join2, distinct1) %>%
+  drop_na() %>%
+  group_by(schname) %>%
+  mutate(indexSTD = (index - mean(index, na.rm = TRUE)) / sd(index, na.rm = TRUE), .after = "index") %>%
+  mutate_at(vars(indexSTD), funs(round(., 3)))
+```
+
+I also decided to standardize the index data. Doing so makes the indices more comparable. 
+
+## Difference-in-Difference Setup
+
+I decided to use a Difference-in-Difference design because I thought it would be very fitting in this case. Difference-in-difference is used to see the effect of a treatment (the release of The College Scorecard) on a treatment group (high-earnings colleges) and a control group (non-high-earnings colleges).
+
+Utilizing and applying the code we learned in class, I set up our final data frame to be used in a Difference-in-Difference design (see comments).
+
+```{r}
+# Setting the date the scorecard came out as the treatment date and defining the TRUE and FALSE for highEarnings.
+regdata <- dataFinal %>%
+  mutate(afterScorecard = week >= as.Date('2015-08-31'), highEarnings = earnings > 0)
+
+# Difference-in-Difference Table
+regdata2 <- regdata %>% 
+  group_by(afterScorecard, highEarnings) %>%
+  summarize(proportionSearching = mean(indexSTD), .groups = 'drop')
+regdata2
+
+# Pull means to use when calculating treatment effect
+means <- regdata %>% 
+  group_by(afterScorecard, highEarnings) %>%
+  summarize(proportionHigh = mean(indexSTD), .groups = 'drop') %>%
+  pull(proportionHigh)
+
+# Look at the treatment effect
+treatmentEffect <- (means[4] - means[2]) - (means[3] - means[1])
+treatmentEffect
+```
+
+## Difference-in-Difference Regression
+
+Then, I performed the OLS regression using the Difference-in-Difference design.
+
+```{r}
+did <- lm(indexSTD ~ afterScorecard*highEarnings, regdata)
+export_summs(did, digits = 3)
+```
+
+## Regression Results
+
+Keeping in mind that we standardized the indices, the baseline expected (standardized) index for a college that primarily grants bachelor degrees is 0.068 before the release of the scorecard. 
+
+Purely high-earnings colleges' indices are expected to be about 0.004 higher than that, so before the release of the scorecard, people were slightly more interested in high-earnings colleges.
+
+However, after the release of the scorecard, the expected standardized index decreases by 0.359, which is a LOT in this case. It may not seem like that much, but ~0.36 is much greater than ~0.07. The interest in high-earnings colleges also goes down by 0.023 from the baseline after the release of the scorecard. This indicates that the scorecard did not have a positive effect on the interest in high-earnings colleges. 
+
+Further, our R squared value is very low, which indicates that our independent variable (The College Scorecard) does not explain much of the variation in our dependent variable (Google Trends inidices), but our coefficients for the intercept and after the release of the scorecard are very statistically significant, which means there is a relationship there.
+
+## Graph
+
+```{r}
+ggplot(regdata, aes(week, indexSTD, color = highEarnings)) +
+  stat_summary(geom = 'line') +
+  labs(x = "Time", y = "Index") +
+  geom_vline(aes(xintercept = as.integer(as.Date('2015-09-01'))), linetype = 'dashed', col = "black")
+```
+
+I wanted to see the actual distribution of the data, so I graphed the index of high-earnings colleges against non-high-earnings colleges over time. The dashed black line indicates the release of the scorecard. It appears that parallel trends holds true in this case as the indices of high-earnings colleges and non-high-earnings colleges seem to follow the same trend and do not vary by much. Each year, they seem to peak the few months before applications are due, as well as around the time decisions are due, and trough at the end of each year around the time applications are due. The peaks also get smaller and smaller each year, so there is very little evidence that the release of the Scorecard impacted interest in these colleges based on the Google Trends data.
+
+## Conclusion
+
+The goal of this project was to answer the question: Among colleges that predominantly grant bachelor’s degrees, did the release of the Scorecard shift student interest to high-earnings colleges relative to low-earnings ones (as proxied by Google searches for keywords associated with those colleges)? Based on the results from our regression, we cannot conclude that the release of the Scorecard shifted student interest to high-earnings colleges relative to low-earnings ones. In fact, there's more evidence to suggest that student interest was lowered after the release of the scorecard, but that is not what we were testing so we cannot conclude that. At the end of the day, the impact of the Scorecard was almost nothing, if not a negative effect on interest, as we can tell from the regression coefficients and the graph since they show that overall interest went down after release of the Scorecard, and interest in purely high-earnings colleges did not change relative to non-high-earnings colleges.
